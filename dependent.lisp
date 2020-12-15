@@ -532,7 +532,7 @@
 
 ;;; MAKE-PROCESS-LOCK: Creating a process lock.
 
-#-(or sbcl (and cmu mp) (and ecl threads) (and clasp threads))
+#-(or abcl sbcl (and cmu mp) (and ecl threads) (and clasp threads))
 (defun make-process-lock (name)
   (declare (ignore name))
   nil)
@@ -553,6 +553,10 @@
 (defun make-process-lock (name)
   (mp:make-recursive-mutex name))
 
+#+abcl
+(defun make-process-lock (name)
+  (threads:make-thread-lock))
+
 ;;; HOLDING-LOCK: Execute a body of code with a lock held.
 
 ;;; The holding-lock macro takes a timeout keyword argument.  EVENT-LISTEN
@@ -561,7 +565,7 @@
 
 ;; If you're not sharing DISPLAY objects within a multi-processing
 ;; shared-memory environment, this is sufficient
-#-(or sbcl (and CMU mp) (and ecl threads) (and clasp threads))
+#-(or abcl sbcl (and CMU mp) (and ecl threads) (and clasp threads))
 (defmacro holding-lock ((locator display &optional whostate &key timeout) &body body)
   (declare (ignore locator display whostate timeout))
   `(progn ,@body))
@@ -595,14 +599,6 @@
   `(mp:with-lock-held (,lock ,whostate ,@(and timeout `(:timeout ,timeout)))
      ,@body))
 
-#+clisp
-(defmacro holding-lock ((lock display &optional (whostate "CLX wait")
-                              &key timeout)
-                        &body body)
-  (declare (ignore lock display whostate timeout))
-  `(progn
-     ,@body))
-
 #+(and ecl threads)
 (defmacro holding-lock ((lock display &optional (whostate "CLX wait")
                               &key timeout)
@@ -628,6 +624,14 @@
   (declare (ignore display whostate))
   `(sb-thread:with-recursive-lock (,lock ,@(when timeout
                                              `(:timeout ,timeout)))
+     ,@body))
+
+#+abcl
+(defmacro holding-lock ((lock display &optional (whostate "CLX wait")
+                              &key timeout)
+                        &body body)
+  (declare (ignore display whostate timeout))
+  `(threads:with-thread-lock (,lock)
      ,@body))
 
 ;;; WITHOUT-ABORTS
@@ -727,10 +731,15 @@
 
 (declaim (inline process-wakeup))
 
-#-(or (and sbcl sb-thread) (and cmu mp) (and ecl threads) (and clasp threads))
+#-(or abcl (and sbcl sb-thread) (and cmu mp) (and ecl threads) (and clasp threads))
 (defun process-wakeup (process)
   (declare (ignore process))
   nil)
+
+#+abcl
+(defun process-wakeup (process)
+  (declare (ignore process))
+  (threads:yield))
 
 #+(and cmu mp)
 (defun process-wakeup (process)
@@ -770,7 +779,7 @@
 
 ;;; Default return NIL, which is acceptable even if there is a scheduler.
 
-#-(or sbcl (and cmu mp) (and ecl threads) (and clasp threads))
+#-(or abcl sbcl (and cmu mp) (and ecl threads) (and clasp threads))
 (defun current-process ()
   nil)
 
@@ -781,6 +790,10 @@
 #+sbcl
 (defun current-process ()
   sb-thread:*current-thread*)
+
+#+abcl
+(defun current-process ()
+  (threads:current-thread))
 
 ;;; WITHOUT-INTERRUPTS -- provide for atomic operations.
 
@@ -813,25 +826,34 @@
 ;; This should use GET-SETF-METHOD to avoid evaluating subforms multiple times.
 ;; It doesn't because CLtL doesn't pass the environment to GET-SETF-METHOD.
 
-;; FIXME: both sbcl and ecl has compare-and-swap these days.
-;; FIXME: Verify for clasp 
-
-#-sbcl
-(defmacro conditional-store (place old-value new-value)
-  `(without-interrupts
-     (cond ((eq ,place ,old-value)
-            (setf ,place ,new-value)
-            t))))
-
-#+sbcl
+#-(or (and clasp threads) ecl sbcl)
 (progn
   (defvar *conditional-store-lock*
-    (sb-thread:make-mutex :name "conditional store"))
+    (make-process-lock "conditional store"))
   (defmacro conditional-store (place old-value new-value)
-    `(sb-thread:with-mutex (*conditional-store-lock*)
-       (cond ((eq ,place ,old-value)
-              (setf ,place ,new-value)
-              t)))))
+    `(holding-lock (*conditional-store-lock* nil)
+       (if (eq ,place ,old-value)
+           (prog1 t
+             (setf ,place ,new-value))
+           nil))))
+
+#+(and clasp threads)
+(defmacro conditional-store (place old-value new-value)
+  (let ((ov (gensym)))
+    `(let ((,ov ,old-value))
+       (eq ,ov (mp:cas ,place ,ov ,new-value)))))
+
+#+ecl
+(defmacro conditional-store (place old-value new-value)
+  (let ((ov (gensym)))
+    `(let ((,ov ,old-value))
+       (eq ,ov (mp:compare-and-swap ,place ,ov ,new-value)))))
+
+#+sbcl
+(defmacro conditional-store (place old-value new-value)
+  (let ((ov (gensym)))
+    `(let ((,ov ,old-value))
+       (eq ,ov (sb-ext:compare-and-swap ,place ,ov ,new-value)))))
 
 ;;;----------------------------------------------------------------------------
 ;;; IO Error Recovery
